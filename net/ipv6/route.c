@@ -5266,6 +5266,8 @@ static int ip6_route_multipath_del(struct fib6_config *cfg,
 	remaining = cfg->fc_mp_len;
 	rtnh = (struct rtnexthop *)cfg->fc_mp;
 
+	printk(KERN_INFO "delete multipath route\n");
+
 	/* Parse a Multipath Entry */
 	while (rtnh_ok(rtnh, remaining)) {
 		memcpy(&r_cfg, cfg, sizeof(*cfg));
@@ -5307,6 +5309,7 @@ static int inet6_rtm_delroute(struct sk_buff *skb, struct nlmsghdr *nlh,
 		NL_SET_ERR_MSG(extack, "Nexthop id does not exist");
 		return -EINVAL;
 	}
+	printk(KERN_INFO "delete route\n");
 
 	if (cfg.fc_mp)
 		return ip6_route_multipath_del(&cfg, extack);

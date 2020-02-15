@@ -5338,6 +5338,26 @@ static int inet6_rtm_newroute(struct sk_buff *skb, struct nlmsghdr *nlh,
 		return ip6_route_add(&cfg, GFP_KERNEL, extack);
 }
 
+
+static int inet6_rtm_altroute(struct sk_buff *skb, struct nlmsghdr *nlh,
+			      struct netlink_ext_ack *extack)
+{
+	struct fib6_config cfg;
+	int err;
+
+	err = rtm_to_fib6_config(skb, nlh, &cfg, extack);
+	if (err < 0)
+		return err;
+
+	if (cfg.fc_metric == 0)
+		cfg.fc_metric = IP6_RT_PRIO_USER;
+
+	if (cfg.fc_mp)
+		return ip6_route_multipath_add_alt(&cfg, extack);
+	else
+		return ip6_route_add_alt(&cfg, GFP_KERNEL, extack);
+}
+
 /* add the overhead of this fib6_nh to nexthop_len */
 static int rt6_nh_nlmsg_size(struct fib6_nh *nh, void *arg)
 {
@@ -6442,6 +6462,11 @@ int __init ip6_route_init(void)
 
 	ret = rtnl_register_module(THIS_MODULE, PF_INET6, RTM_NEWROUTE,
 				   inet6_rtm_newroute, NULL, 0);
+	if (ret < 0)
+		goto out_register_late_subsys;
+
+	ret = rtnl_register_module(THIS_MODULE, PF_INET6, RTM_ALTROUTE,
+				   inet6_rtm_altroute, NULL, 0);
 	if (ret < 0)
 		goto out_register_late_subsys;
 

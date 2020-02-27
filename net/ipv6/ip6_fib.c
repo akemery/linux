@@ -168,8 +168,12 @@ void fib6_info_destroy_rcu(struct rcu_head *head)
 
 	WARN_ON(f6i->fib6_node);
 
-	if (f6i->nh)
+	if (f6i->nh){
+		if(f6i->nh->nh_flags & RTNH_F_BACK_LINK){
+			return;
+		}
 		nexthop_put(f6i->nh);
+	}
 	else
 		fib6_nh_release(f6i->fib6_nh);
 
@@ -756,6 +760,17 @@ static struct fib6_node *fib6_add_1(struct net *net,
 	do {
 		struct fib6_info *leaf = rcu_dereference_protected(fn->leaf,
 					    lockdep_is_held(&table->tb6_lock));
+#if 1
+		if(leaf && leaf->nh && (leaf->nh->nh_flags & RTNH_F_BACK_LINK)
+			&& ipv6_addr_equal(&leaf->fib6_dst.addr,addr)
+			&& (leaf->fib6_dst.plen == plen)){			
+			printk(KERN_INFO "backlink in fib_add (%d)\n", leaf->nh->id);
+			return fn;
+		}
+
+		if(leaf && leaf->nh && leaf->nh->is_group)
+		printk(KERN_INFO "nexthop group in fib6_add (%d)\n", leaf->nh->id);
+#endif
 		key = (struct rt6key *)((u8 *)leaf + offset);
 
 		/*
@@ -976,6 +991,7 @@ static void __fib6_drop_pcpu_from(struct fib6_nh *fib6_nh,
 			struct fib6_info *from;
 
 			from = xchg((__force struct fib6_info **)&pcpu_rt->from, NULL);
+			//printk(KERN_INFO "info_release fib6_drop_pcpu_from ip6_fib.c %p\n", from);
 			fib6_info_release(from);
 		}
 	}
@@ -1045,6 +1061,7 @@ static void fib6_purge_rt(struct fib6_info *rt, struct fib6_node *fn,
 				fib6_info_hold(new_leaf);
 
 				rcu_assign_pointer(fn->leaf, new_leaf);
+				//printk(KERN_INFO "info_release purge_rt ip6_fib.c %p\n", rt);
 				fib6_info_release(rt);
 			}
 			fn = rcu_dereference_protected(fn->parent,
@@ -1078,12 +1095,18 @@ static int fib6_add_rt2node(struct fib6_node *fn, struct fib6_info *rt,
 
 	if (info->nlh && (info->nlh->nlmsg_flags & NLM_F_APPEND))
 		nlflags |= NLM_F_APPEND;
+	
 
 	ins = &fn->leaf;
 
 	for (iter = leaf; iter;
 	     iter = rcu_dereference_protected(iter->fib6_next,
 				lockdep_is_held(&rt->fib6_table->tb6_lock))) {
+
+		if(iter->nh && (iter->nh->nh_flags & RTNH_F_BACK_LINK)){
+			printk(KERN_INFO "adding on back_link %d\n", iter->nh->id);
+			nlflags |= NLM_F_APPEND;
+		}
 		/*
 		 *	Search for duplicates
 		 */
@@ -1282,6 +1305,7 @@ add:
 		fib6_purge_rt(iter, fn, info->nl_net);
 		if (rcu_access_pointer(fn->rr_ptr) == iter)
 			fn->rr_ptr = NULL;
+		//printk(KERN_INFO "info_release add_rt2node ip6_fib.c %p\n", iter);
 		fib6_info_release(iter);
 
 		if (nsiblings) {
@@ -1298,6 +1322,7 @@ add:
 					fib6_purge_rt(iter, fn, info->nl_net);
 					if (rcu_access_pointer(fn->rr_ptr) == iter)
 						fn->rr_ptr = NULL;
+					//printk(KERN_INFO "info_release add_rt2node ip6_fib.c %p\n", iter);
 					fib6_info_release(iter);
 					nsiblings--;
 					info->nl_net->ipv6.rt6_stats->fib_rt_entries--;
@@ -1387,6 +1412,88 @@ int fib6_add(struct fib6_node *root, struct fib6_info *rt,
 			&rt->fib6_dst.addr, rt->fib6_dst.plen,
 			offsetof(struct fib6_info, fib6_dst), allow_create,
 			replace_required, extack);
+
+	if(fn && fn->leaf && fn->leaf->nh && fn->leaf->nh->is_back){
+		printk(KERN_INFO "backlink nexthop is enable %d\n",
+				fn->leaf->nh->id);
+		rt->nh->has_back = true;
+		rt->nh->back_id = fn->leaf->nh->id;
+		fn->leaf->nh->prin_id = rt->nh->id;
+		rt->nh->is_prin = true;
+	}
+
+	if(fn && fn->leaf && fn->leaf->nh && (fn->leaf->nh->nh_flags & RTNH_F_BACK_LINK)){
+		struct nh_group *nhg;
+		struct nh_info *newnhi;
+		if(!fn->leaf->nh->is_group){
+			struct nh_info *leafnhi;
+			printk(KERN_INFO "backlink nexthop is not a group %d\n",
+				fn->leaf->nh->id);
+			leafnhi = rtnl_dereference(fn->leaf->nh->nh_info);
+			if(!leafnhi){
+				printk(KERN_INFO "leaf fib6_info does not have "
+					"nexthop info\n");
+				goto failure;
+			}
+
+			if(!leafnhi->nh_parent)
+			{
+				printk(KERN_INFO "leaf fib6_info does not have "
+					"nexthop parent\n");
+				goto failure;
+			}
+
+			if(!leafnhi->nh_parent->is_group)
+			{
+				printk(KERN_INFO "leaf fib6_info nexthop parent"
+					" is not a group %d\n",
+					leafnhi->nh_parent->id );
+				goto failure;
+			}
+
+			nhg = rtnl_dereference(leafnhi->nh_parent->nh_grp);
+			if(!nhg){
+				printk(KERN_INFO "leaf fib6_info nexthop parent"
+					"does not have nexthop group entries\n");
+				goto failure;
+			}
+			newnhi = rtnl_dereference(rt->nh->nh_info);
+			if(!newnhi){
+				printk(KERN_INFO "new fib6_info does not have nexthop info\n");
+				goto failure;
+			}
+			nhg->nh_entries[0].nh = rt->nh;
+			nhg->nh_entries[0].weight = newnhi->fib6_nh.fib_nh_weight;
+			list_add(&nhg->nh_entries[0].nh_list, &rt->nh->grp_list);
+			nhg->nh_entries[0].nh_parent = leafnhi->nh_parent;
+			fn->leaf->nh = leafnhi->nh_parent;
+
+		}
+		else{
+			if(!rt->nh){
+				printk(KERN_INFO "new fib6_info does not have nexthop\n");
+				goto failure;
+			}
+			nhg = rtnl_dereference(fn->leaf->nh->nh_grp);
+			if(!nhg){
+				printk(KERN_INFO "new fib6_info does not have nexthop nhg\n");
+				goto failure;
+			}
+			newnhi = rtnl_dereference(rt->nh->nh_info);
+			if(!newnhi){
+				printk(KERN_INFO "new fib6_info does not have nexthop info\n");
+				goto failure;
+			}
+			nhg->nh_entries[0].nh = rt->nh;
+			nhg->nh_entries[0].weight = newnhi->fib6_nh.fib_nh_weight;
+			list_add(&nhg->nh_entries[0].nh_list, &rt->nh->grp_list);
+			nhg->nh_entries[0].nh_parent = fn->leaf->nh;
+			return 0;
+		}
+		
+
+	}
+
 	if (IS_ERR(fn)) {
 		err = PTR_ERR(fn);
 		fn = NULL;
@@ -1528,6 +1635,7 @@ failure:
 		fib6_repair_tree(info->nl_net, table, fn);
 	return err;
 }
+
 
 /*
  *	Routing tree lookup
@@ -1884,6 +1992,7 @@ static struct fib6_node *fib6_repair_tree(struct net *net,
 			return pn;
 
 		RCU_INIT_POINTER(pn->leaf, NULL);
+		//printk(KERN_INFO "info_release repair_tree ip6_fib.c %p\n", pn_leaf);
 		fib6_info_release(pn_leaf);
 		fn = pn;
 	}
@@ -1907,6 +2016,15 @@ static void fib6_del_route(struct fib6_table *table, struct fib6_node *fn,
 	 */
 	leaf = rcu_dereference_protected(fn->leaf,
 					 lockdep_is_held(&table->tb6_lock));
+
+	if(leaf && leaf->nh && (leaf->nh->nh_flags & RTNH_F_BACK_LINK)){			
+			printk(KERN_INFO "backlink in fib6_del_route (%d)\n", leaf->nh->id);
+			//return;
+	}
+
+	if(leaf && leaf->nh && leaf->nh->is_group)
+		printk(KERN_INFO "nexthop group in fib6_del_route (%d)\n", leaf->nh->id);
+
 	if (leaf == rt && !rt->fib6_nsiblings) {
 		if (rcu_access_pointer(rt->fib6_next))
 			replace_rt = rcu_dereference_protected(rt->fib6_next,
@@ -1985,6 +2103,8 @@ static void fib6_del_route(struct fib6_table *table, struct fib6_node *fn,
 	if (!info->skip_notify)
 		inet6_rt_notify(RTM_DELROUTE, rt, info, 0);
 
+	
+	//printk(KERN_INFO "info_release del_route ip6_fib.c %p\n", rt);
 	fib6_info_release(rt);
 }
 

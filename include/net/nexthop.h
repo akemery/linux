@@ -88,6 +88,11 @@ struct nexthop {
 	u8			protocol;   /* app managing this nh */
 	u8			nh_flags;
 	bool			is_group;
+	bool			has_back;
+	bool			is_back;
+	bool			is_prin;
+	u32			prin_id;
+	u32			back_id;
 
 	refcount_t		refcnt;
 	struct rcu_head		rcu;
@@ -304,4 +309,9 @@ static inline void nexthop_path_fib6_result(struct fib6_result *res, int hash)
 int nexthop_for_each_fib6_nh(struct nexthop *nh,
 			     int (*cb)(struct fib6_nh *nh, void *arg),
 			     void *arg);
+
+struct nexthop *nexthop_create_alt_single_group(struct net *net, 
+		struct fib6_config *cfg, struct nexthop *oldnh, 
+		struct nexthop *altnh, struct netlink_ext_ack *extack, 
+		struct sk_buff *skb, struct nlmsghdr *nlh );
 #endif

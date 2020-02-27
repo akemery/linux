@@ -380,6 +380,7 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 	}
 
 	from = xchg((__force struct fib6_info **)&rt->from, NULL);
+	//printk(KERN_INFO "info_release dst_destroy route.c %p\n", from);
 	fib6_info_release(from);
 }
 
@@ -1000,7 +1001,7 @@ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
 			fib6_clean_expires(rt);
 		else
 			fib6_set_expires(rt, jiffies + HZ * lifetime);
-
+		//printk(KERN_INFO "info_release rt6_route_rcv route.c %p\n", rt);
 		fib6_info_release(rt);
 	}
 	return 0;
@@ -1418,6 +1419,7 @@ static struct rt6_info *rt6_make_pcpu_route(struct net *net,
 		struct fib6_info *from;
 
 		from = xchg((__force struct fib6_info **)&pcpu_rt->from, NULL);
+		//printk(KERN_INFO "info_release rt6_make_pcpu_route route.c %p\n", from);
 		fib6_info_release(from);
 	}
 
@@ -1447,6 +1449,7 @@ static void rt6_remove_exception(struct rt6_exception_bucket *bucket,
 	 * some [sk] cache may keep the dst around for unlimited time
 	 */
 	from = xchg((__force struct fib6_info **)&rt6_ex->rt6i->from, NULL);
+	//printk(KERN_INFO "info_release rt6_remove_exception route.c %p\n", from);
 	fib6_info_release(from);
 	dst_dev_put(&rt6_ex->rt6i->dst);
 
@@ -3709,6 +3712,7 @@ int ip6_route_add(struct fib6_config *cfg, gfp_t gfp_flags,
 		return PTR_ERR(rt);
 
 	err = __ip6_ins_rt(rt, &cfg->fc_nlinfo, extack);
+	//printk(KERN_INFO "info_release root_add route.c %p\n", rt);
 	fib6_info_release(rt);
 
 	return err;
@@ -3905,6 +3909,11 @@ static int ip6_route_del(struct fib6_config *cfg,
 			if (rt->nh && cfg->fc_nh_id &&
 			    rt->nh->id != cfg->fc_nh_id)
 				continue;
+
+			if(rt->nh && (rt->nh->nh_flags & RTNH_F_BACK_LINK)){
+				printk(KERN_INFO "ip6_route_del %d\n", rt->nh->id);
+				continue;
+			}
 
 			if (cfg->fc_flags & RTF_CACHE) {
 				int rc = 0;
@@ -5168,6 +5177,7 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 	err_nh = NULL;
 	list_for_each_entry(nh, &rt6_nh_list, next) {
 		err = __ip6_ins_rt(nh->fib6_info, info, extack);
+		//printk(KERN_INFO "info_release root_add_multi route.c %p\n", nh->fib6_info);
 		fib6_info_release(nh->fib6_info);
 
 		if (!err) {
@@ -5266,7 +5276,7 @@ static int ip6_route_multipath_del(struct fib6_config *cfg,
 	remaining = cfg->fc_mp_len;
 	rtnh = (struct rtnexthop *)cfg->fc_mp;
 
-	printk(KERN_INFO "delete multipath route\n");
+	//printk(KERN_INFO "delete multipath route\n");
 
 	/* Parse a Multipath Entry */
 	while (rtnh_ok(rtnh, remaining)) {
@@ -5309,7 +5319,7 @@ static int inet6_rtm_delroute(struct sk_buff *skb, struct nlmsghdr *nlh,
 		NL_SET_ERR_MSG(extack, "Nexthop id does not exist");
 		return -EINVAL;
 	}
-	printk(KERN_INFO "delete route\n");
+	//printk(KERN_INFO "delete route\n");
 
 	if (cfg.fc_mp)
 		return ip6_route_multipath_del(&cfg, extack);
@@ -5338,14 +5348,261 @@ static int inet6_rtm_newroute(struct sk_buff *skb, struct nlmsghdr *nlh,
 		return ip6_route_add(&cfg, GFP_KERNEL, extack);
 }
 
+static int ip6_route_multipath_add_alt(struct fib6_config *cfg,
+				   struct netlink_ext_ack *extack)
+{
+	struct fib6_info *rt_notif = NULL, *rt_last = NULL;
+	struct nl_info *info = &cfg->fc_nlinfo;
+	struct fib6_config r_cfg;
+	struct rtnexthop *rtnh;
+	struct fib6_info *rt;
+	struct rt6_nh *err_nh;
+	struct rt6_nh *nh, *nh_safe;
+	__u16 nlflags;
+	int remaining;
+	int attrlen;
+	int err = 1;
+	int nhn = 0;
+
+	
+
+	int replace = (cfg->fc_nlinfo.nlh &&
+		       (cfg->fc_nlinfo.nlh->nlmsg_flags & NLM_F_REPLACE));
+
+	//printk(KERN_INFO "adding multipath alternate route ifindex(%d), metric(%d)"
+	//	"dst(%pI6) src(%pI6) gw(%pI6)\n", cfg->fc_ifindex, cfg->fc_metric,
+	//	&cfg->fc_dst, &cfg->fc_src, &cfg->fc_gateway);
+
+	LIST_HEAD(rt6_nh_list);
+
+	nlflags = replace ? NLM_F_REPLACE : NLM_F_CREATE;
+	if (info->nlh && info->nlh->nlmsg_flags & NLM_F_APPEND)
+		nlflags |= NLM_F_APPEND;
+
+	remaining = cfg->fc_mp_len;
+	rtnh = (struct rtnexthop *)cfg->fc_mp;
+
+	/* Parse a Multipath Entry and build a list (rt6_nh_list) of
+	 * fib6_info structs per nexthop
+	 */
+	while (rtnh_ok(rtnh, remaining)) {
+		memcpy(&r_cfg, cfg, sizeof(*cfg));
+		if (rtnh->rtnh_ifindex)
+			r_cfg.fc_ifindex = rtnh->rtnh_ifindex;
+
+		attrlen = rtnh_attrlen(rtnh);
+		if (attrlen > 0) {
+			struct nlattr *nla, *attrs = rtnh_attrs(rtnh);
+
+			nla = nla_find(attrs, attrlen, RTA_GATEWAY);
+			if (nla) {
+				r_cfg.fc_gateway = nla_get_in6_addr(nla);
+				r_cfg.fc_flags |= RTF_GATEWAY;
+			}
+			r_cfg.fc_encap = nla_find(attrs, attrlen, RTA_ENCAP);
+			nla = nla_find(attrs, attrlen, RTA_ENCAP_TYPE);
+			if (nla)
+				r_cfg.fc_encap_type = nla_get_u16(nla);
+		}
+
+		r_cfg.fc_flags |= (rtnh->rtnh_flags & RTNH_F_ONLINK);
+		rt = ip6_route_info_create(&r_cfg, GFP_KERNEL, extack);
+		if (IS_ERR(rt)) {
+			err = PTR_ERR(rt);
+			rt = NULL;
+			goto cleanup;
+		}
+		if (!rt6_qualify_for_ecmp(rt)) {
+			err = -EINVAL;
+			NL_SET_ERR_MSG(extack,
+				       "Device only routes can not be added for IPv6 using the multipath API.");
+			fib6_info_release(rt);
+			goto cleanup;
+		}
+
+		rt->fib6_nh->fib_nh_weight = rtnh->rtnh_hops + 1;
+
+		err = ip6_route_info_append(info->nl_net, &rt6_nh_list,
+					    rt, &r_cfg);
+		if (err) {
+			fib6_info_release(rt);
+			goto cleanup;
+		}
+
+		rtnh = rtnh_next(rtnh, &remaining);
+	}
+
+	if (list_empty(&rt6_nh_list)) {
+		NL_SET_ERR_MSG(extack,
+			       "Invalid nexthop configuration - no valid nexthops");
+		return -EINVAL;
+	}
+
+	/* for add and replace send one notification with all nexthops.
+	 * Skip the notification in fib6_add_rt2node and send one with
+	 * the full route when done
+	 */
+	info->skip_notify = 1;
+
+	/* For add and replace, send one notification with all nexthops. For
+	 * append, send one notification with all appended nexthops.
+	 */
+	info->skip_notify_kernel = 1;
+
+	err_nh = NULL;
+	list_for_each_entry(nh, &rt6_nh_list, next) {
+		err = __ip6_ins_rt(nh->fib6_info, info, extack);
+		fib6_info_release(nh->fib6_info);
+
+		if (!err) {
+			/* save reference to last route successfully inserted */
+			rt_last = nh->fib6_info;
+
+			/* save reference to first route for notification */
+			if (!rt_notif)
+				rt_notif = nh->fib6_info;
+		}
+
+		/* nh->fib6_info is used or freed at this point, reset to NULL*/
+		nh->fib6_info = NULL;
+		if (err) {
+			if (replace && nhn)
+				NL_SET_ERR_MSG_MOD(extack,
+						   "multipath route replace failed (check consistency of installed routes)");
+			err_nh = nh;
+			goto add_errout;
+		}
+
+		/* Because each route is added like a single route we remove
+		 * these flags after the first nexthop: if there is a collision,
+		 * we have already failed to add the first nexthop:
+		 * fib6_add_rt2node() has rejected it; when replacing, old
+		 * nexthops have been replaced by first new, the rest should
+		 * be added to it.
+		 */
+		cfg->fc_nlinfo.nlh->nlmsg_flags &= ~(NLM_F_EXCL |
+						     NLM_F_REPLACE);
+		nhn++;
+	}
+
+	/* An in-kernel notification should only be sent in case the new
+	 * multipath route is added as the first route in the node, or if
+	 * it was appended to it. We pass 'rt_notif' since it is the first
+	 * sibling and might allow us to skip some checks in the replace case.
+	 */
+	if (ip6_route_mpath_should_notify(rt_notif)) {
+		enum fib_event_type fib_event;
+
+		if (rt_notif->fib6_nsiblings != nhn - 1)
+			fib_event = FIB_EVENT_ENTRY_APPEND;
+		else
+			fib_event = FIB_EVENT_ENTRY_REPLACE;
+
+		err = call_fib6_multipath_entry_notifiers(info->nl_net,
+							  fib_event, rt_notif,
+							  nhn - 1, extack);
+		if (err) {
+			/* Delete all the siblings that were just added */
+			err_nh = NULL;
+			goto add_errout;
+		}
+	}
+
+	/* success ... tell user about new route */
+	ip6_route_mpath_notify(rt_notif, rt_last, info, nlflags);
+	goto cleanup;
+
+add_errout:
+	/* send notification for routes that were added so that
+	 * the delete notifications sent by ip6_route_del are
+	 * coherent
+	 */
+	if (rt_notif)
+		ip6_route_mpath_notify(rt_notif, rt_last, info, nlflags);
+
+	/* Delete routes that were already added */
+	list_for_each_entry(nh, &rt6_nh_list, next) {
+		if (err_nh == nh)
+			break;
+		ip6_route_del(&nh->r_cfg, extack);
+	}
+
+cleanup:
+	list_for_each_entry_safe(nh, nh_safe, &rt6_nh_list, next) {
+		if (nh->fib6_info)
+			fib6_info_release(nh->fib6_info);
+		list_del(&nh->next);
+		kfree(nh);
+	}
+
+	return err;
+}
+
+int ip6_route_add_alt(struct fib6_config *cfg, gfp_t gfp_flags,
+		struct sk_buff *skb, struct nlmsghdr *nlh, 
+		struct netlink_ext_ack *extack)
+{
+	struct fib6_table *table;
+	struct fib6_info *rt;
+	struct fib6_node *fn;
+	struct nexthop *nh;/* *newnh;*/
+	struct net *net = cfg->fc_nlinfo.nl_net;
+	int err = -ESRCH;
+
+
+	table = fib6_get_table(net, cfg->fc_table);
+	if (!table) {
+		NL_SET_ERR_MSG(extack, "FIB table does not exist");
+		return err;
+	}
+
+	//printk(KERN_INFO "adding alternate route ifindex \n");
+
+	rcu_read_lock();
+
+	fn = fib6_locate(&table->tb6_root,
+			 &cfg->fc_dst, cfg->fc_dst_len,
+			 &cfg->fc_src, cfg->fc_src_len,
+			 !(cfg->fc_flags & RTF_CACHE));
+
+	nh = nexthop_find_by_id(cfg->fc_nlinfo.nl_net, cfg->fc_nh_id);
+	if(!nh)
+		goto out;
+
+	if (fn) {
+		for_each_fib6_node_rt_rcu(fn) {
+			if(!rt || !rt->nh)
+				continue;
+			if(rt->nh && (rt->nh->nh_flags & RTNH_F_BACK_LINK)){
+				printk(KERN_INFO "found backlink nexthop old (%d)"
+					" new nexthop (%d)\n", rt->nh->id, nh->id);
+				if(rt->nh->id==nh->id)
+					goto out;
+			}
+			nh->is_back = true;
+			nh->prin_id = rt->nh->id;
+			rt->nh->is_prin = true;
+			rt->nh->has_back = true;
+			rt->nh->back_id = nh->id;
+		}
+	}
+	rcu_read_unlock();
+	return 0;
+out:
+	//printk(KERN_INFO "Unable to create nexthop old (%d)"
+	//			" new nexthop (%d)\n", rt->nh->id, nh->id);
+	return err;
+}
 
 static int inet6_rtm_altroute(struct sk_buff *skb, struct nlmsghdr *nlh,
 			      struct netlink_ext_ack *extack)
 {
 	struct fib6_config cfg;
 	int err;
-
+	
 	err = rtm_to_fib6_config(skb, nlh, &cfg, extack);
+
+
 	if (err < 0)
 		return err;
 
@@ -5355,7 +5612,7 @@ static int inet6_rtm_altroute(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (cfg.fc_mp)
 		return ip6_route_multipath_add_alt(&cfg, extack);
 	else
-		return ip6_route_add_alt(&cfg, GFP_KERNEL, extack);
+		return ip6_route_add_alt(&cfg, GFP_KERNEL, skb, nlh, extack);
 }
 
 /* add the overhead of this fib6_nh to nexthop_len */

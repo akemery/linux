@@ -180,11 +180,6 @@ enum {
 	RTM_GETVLAN,
 #define RTM_GETVLAN	RTM_GETVLAN
 	
-//	RTM_ALTROUTE	= 116,
-//#define RTM_ALTROUTE	RTM_ALTROUTE
-
-
-
 	__RTM_MAX,
 #define RTM_MAX		(((__RTM_MAX + 3) & ~3) - 1)
 };
@@ -406,7 +401,7 @@ struct rtnexthop {
 #define RTNH_F_LINKDOWN		16	/* carrier-down on nexthop */
 #define RTNH_F_UNRESOLVED	32	/* The entry is unresolved (ipmr) */
 #define RTNH_F_BACK_LINK	64	/*Nexthop group has a backup link*/
-#define RTNH_F_DUMMY		128	/*Dummy nexthop*/
+
 
 #define RTNH_COMPARE_MASK	(RTNH_F_DEAD | RTNH_F_LINKDOWN | RTNH_F_OFFLOAD)
 

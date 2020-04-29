@@ -380,7 +380,6 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 	}
 
 	from = xchg((__force struct fib6_info **)&rt->from, NULL);
-	//printk(KERN_INFO "info_release dst_destroy route.c %p\n", from);
 	fib6_info_release(from);
 }
 
@@ -1008,7 +1007,6 @@ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
 			fib6_clean_expires(rt);
 		else
 			fib6_set_expires(rt, jiffies + HZ * lifetime);
-		//printk(KERN_INFO "info_release rt6_route_rcv route.c %p\n", rt);
 		fib6_info_release(rt);
 	}
 	return 0;
@@ -1427,7 +1425,6 @@ static struct rt6_info *rt6_make_pcpu_route(struct net *net,
 		struct fib6_info *from;
 
 		from = xchg((__force struct fib6_info **)&pcpu_rt->from, NULL);
-		//printk(KERN_INFO "info_release rt6_make_pcpu_route route.c %p\n", from);
 		fib6_info_release(from);
 	}
 
@@ -1457,7 +1454,6 @@ static void rt6_remove_exception(struct rt6_exception_bucket *bucket,
 	 * some [sk] cache may keep the dst around for unlimited time
 	 */
 	from = xchg((__force struct fib6_info **)&rt6_ex->rt6i->from, NULL);
-	//printk(KERN_INFO "info_release rt6_remove_exception route.c %p\n", from);
 	fib6_info_release(from);
 	dst_dev_put(&rt6_ex->rt6i->dst);
 
@@ -3709,41 +3705,85 @@ out:
 	return ERR_PTR(err);
 }
 
-static int switch_from_backup_primary(struct fib6_info *rt){
+static int add_alt_route(struct fib6_config *cfg){
+	struct fib6_table *table;
 	struct fib6_node *fn;
-	int found = 0;
-	//printk(KERN_INFO "switch_from_backup_primary %d\n", rt->nh->id);
-	rcu_read_lock();
-	fn = fib6_locate(&rt->fib6_table->tb6_root,
-			 &rt->fib6_dst.addr, rt->fib6_dst.plen,
-			 NULL, 0, true);
-	if(fn && fn->leaf && fn->leaf->nh && fn->leaf->nh->is_back){
-		/*struct nexthop *nh_back, *nh_prin;
-		nh_back = fn->leaf->nh;
-		nh_prin = rt->nh;
-		printk(KERN_INFO "switch_from_backup_primary %d\n", nh_back->id);
-		
-		fn->leaf->nh = rt->nh;
-		fn->leaf->nh = nh_prin;
+	struct nexthop *altnh;
+	bool found = false;
+	int err = -1;
 
-		fn->leaf->nh->nh_back = nh_back;
-		fn->leaf->nh->back_id = nh_back->id;
-		fn->leaf->nh->prin_id = nh_prin->id;
-		fn->leaf->nh->nh_prin = nh_prin;
-		fn->leaf->nh->has_back = true;
-		fn->leaf->nh->nh_back->is_back = true;
-		fn->leaf->nh->is_prin = true;
-		rcu_assign_pointer(fn->leaf->nh->nh_info_prin, nh_prin->nh_info);
-		rcu_assign_pointer(fn->leaf->nh->nh_info_back, nh_back->nh_info);
-		fn->leaf->nh->is_back = false;
-		fn->leaf->nh->is_prin = true;
-		if (rt->nh){
-			list_add(&fn->leaf->nh_list, &fn->leaf->nh->f6i_list);
-		}*/
-		found = 1;
+	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
+	if (!table) {
+		return err;
+	}
+
+	if(!cfg->fc_nh_id)
+		return err;
+
+ 	altnh = nexthop_find_by_id(cfg->fc_nlinfo.nl_net , cfg->fc_nh_id);
+
+	if(!altnh)
+		return err;
+
+	rcu_read_lock();
+	fn = fib6_locate(&table->tb6_root,
+			 &cfg->fc_dst, cfg->fc_dst_len,
+			 &cfg->fc_src, cfg->fc_src_len,
+			 !(cfg->fc_flags & RTF_CACHE));
+
+	if(fn && fn->leaf && fn->leaf->nh){
+		struct nexthop *nh = fn->leaf->nh;
+		if(altnh->id == nh->id)
+			return err;
+		nh->is_prin = true;
+		nh->back_id = altnh->id;
+		rcu_assign_pointer(nh->nh_info_back, altnh->nh_info);
+		found = true;
 	}
 	rcu_read_unlock();
-	return found;
+	if(found)
+		return 0;
+	return err;
+}
+
+static int del_alt_route(struct fib6_config *cfg){
+	struct fib6_table *table;
+	struct fib6_node *fn;
+	struct nexthop *altnh;
+	bool found = false;
+
+	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
+	if (!table) {
+		return -1;
+	}
+
+	if(!cfg->fc_nh_id)
+		return -1;
+
+ 	altnh = nexthop_find_by_id(cfg->fc_nlinfo.nl_net , cfg->fc_nh_id);
+
+	if(!altnh)
+		return -1;
+
+	rcu_read_lock();
+	fn = fib6_locate(&table->tb6_root,
+			 &cfg->fc_dst, cfg->fc_dst_len,
+			 &cfg->fc_src, cfg->fc_src_len,
+			 !(cfg->fc_flags & RTF_CACHE));
+
+	if(fn && fn->leaf && fn->leaf->nh){
+		struct nexthop *nh = fn->leaf->nh;
+		if(nh->back_id != altnh->id)
+			return -1;
+		found = true;
+		nh->is_prin = false;
+		nh->back_id = 0;
+		rcu_assign_pointer(nh->nh_info_back, NULL);
+	}
+	rcu_read_unlock();
+	if(found)
+		return 0;
+	return -1;
 }
 
 
@@ -3751,24 +3791,18 @@ int ip6_route_add(struct fib6_config *cfg, gfp_t gfp_flags,
 		  struct netlink_ext_ack *extack)
 {
 	struct fib6_info *rt;
-	int err;
-	int found;
+	int err = -1;
+	if(cfg->fc_nlinfo.nlh && 
+		(cfg->fc_nlinfo.nlh->nlmsg_flags & NLM_F_ALTROUTE)){
+		err  = add_alt_route(cfg);
+		return err;
+	}
 	rt = ip6_route_info_create(cfg, gfp_flags, extack);
 	if (IS_ERR(rt))
 		return PTR_ERR(rt);
 	
-
-	if(rt && rt->nh){
-		found  = switch_from_backup_primary(rt);
-		if(found){
-			fib6_info_release(rt);
-			return 0;
-		}
-	}
-	
 	err = __ip6_ins_rt(rt, &cfg->fc_nlinfo, extack);
 	fib6_info_release(rt);
-
 	return err;
 }
 
@@ -3944,6 +3978,12 @@ static int ip6_route_del(struct fib6_config *cfg,
 	struct fib6_info *rt;
 	struct fib6_node *fn;
 	int err = -ESRCH;
+
+	if(cfg->fc_nlinfo.nlh && 
+		(cfg->fc_nlinfo.nlh->nlmsg_flags & NLM_F_ALTROUTE)){
+		err = del_alt_route(cfg);
+		return err;
+	}
 
 	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
 	if (!table) {
@@ -5228,7 +5268,6 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 	err_nh = NULL;
 	list_for_each_entry(nh, &rt6_nh_list, next) {
 		err = __ip6_ins_rt(nh->fib6_info, info, extack);
-		//printk(KERN_INFO "info_release root_add_multi route.c %p\n", nh->fib6_info);
 		fib6_info_release(nh->fib6_info);
 
 		if (!err) {
@@ -5369,7 +5408,6 @@ static int inet6_rtm_delroute(struct sk_buff *skb, struct nlmsghdr *nlh,
 		NL_SET_ERR_MSG(extack, "Nexthop id does not exist");
 		return -EINVAL;
 	}
-	//printk(KERN_INFO "delete route\n");
 
 	if (cfg.fc_mp)
 		return ip6_route_multipath_del(&cfg, extack);

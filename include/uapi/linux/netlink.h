@@ -69,6 +69,7 @@ struct nlmsghdr {
 #define NLM_F_EXCL	0x200	/* Do not touch, if it exists	*/
 #define NLM_F_CREATE	0x400	/* Create, if it does not exist	*/
 #define NLM_F_APPEND	0x800	/* Add to end of list		*/
+#define NLM_F_ALTROUTE 0x1000	/* Add alternate route		*/
 
 /* Modifiers to DELETE request */
 #define NLM_F_NONREC	0x100	/* Do not delete recursively	*/
